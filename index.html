@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>X 投稿カウンター</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: system-ui, sans-serif;
+      color: #19253a;
+      background: #f1f5fa;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { width: min(100% - 2rem, 46rem); margin: clamp(2rem, 8vw, 5rem) auto; }
+    h1 { margin: 0 0 .35rem; font-size: clamp(1.65rem, 5vw, 2.6rem); }
+    header > p { margin: 0 0 1.5rem; color: #4c5c71; }
+    .editor, .post {
+      padding: clamp(1rem, 4vw, 1.5rem);
+      border: 1px solid #d4deeb;
+      border-radius: 1rem;
+      background: #fff;
+    }
+    .editor { box-shadow: 0 8px 24px #14365a0d; }
+    label { display: block; margin-bottom: .55rem; font-weight: 700; }
+    textarea {
+      display: block;
+      width: 100%;
+      min-height: 13rem;
+      resize: vertical;
+      padding: .85rem;
+      border: 1px solid #a7b6ca;
+      border-radius: .6rem;
+      font: inherit;
+      line-height: 1.65;
+      color: inherit;
+    }
+    .row { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; justify-content: space-between; }
+    .editor .row { margin-top: .9rem; }
+    #meter { display: flex; flex-wrap: wrap; gap: .25rem .75rem; font-variant-numeric: tabular-nums; }
+    #remaining { color: #4c5c71; }
+    #meter.over, #meter.over #remaining { color: #b42318; font-weight: 700; }
+    button {
+      border: 1px solid transparent;
+      border-radius: .55rem;
+      padding: .65rem .95rem;
+      min-height: 2.75rem;
+      font: inherit;
+      font-weight: 700;
+      color: white;
+      background: #194f9e;
+      cursor: pointer;
+    }
+    button:hover { background: #123c7b; }
+    :focus-visible { outline: 3px solid #538ded; outline-offset: 3px; }
+    #results { display: grid; gap: .8rem; }
+    #status { margin: 1.25rem 0 .7rem; font-weight: 700; }
+    #status:empty, #copy-status:empty { display: none; }
+    h2 { margin: 0; font-size: 1rem; }
+    h2 span { margin-inline-start: .5rem; color: #4c5c71; font-weight: 400; }
+    .copy { color: #194f9e; background: #edf4ff; border-color: #c9dcfa; }
+    .copy:hover { background: #dceaff; }
+    .post p {
+      margin: .8rem 0 0;
+      padding-top: .8rem;
+      border-top: 1px solid #e1e8f0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      line-height: 1.65;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>X 投稿カウンター</h1>
+      <p>文字数を確認し、空行を目印にスレッドへ分割できます。</p>
+    </header>
+    <section class="editor" aria-label="投稿の編集">
+      <label for="draft">投稿文</label>
+      <textarea id="draft" placeholder="ここに投稿文を入力してください"></textarea>
+      <div class="row">
+        <div id="meter" aria-live="polite"><strong id="count"></strong><span id="remaining"></span></div>
+        <button id="split" type="button">分割する</button>
+      </div>
+    </section>
+    <p id="status" role="status"></p>
+    <div id="results"></div>
+    <p id="copy-status" role="status"></p>
+  </main>
+  <script>
+    const LIMIT = 280;
+    const draft = document.querySelector('#draft');
+    const meter = document.querySelector('#meter');
+    const count = document.querySelector('#count');
+    const remaining = document.querySelector('#remaining');
+    const status = document.querySelector('#status');
+    const results = document.querySelector('#results');
+    const copyStatus = document.querySelector('#copy-status');
+
+    function* weightedTokens(text) {
+      for (const [value] of text.matchAll(/https?:\/\/\S*|[\s\S]/gu)) {
+        const point = value.codePointAt(0);
+        const weight = value.startsWith('http://') || value.startsWith('https://')
+          ? 23
+          : (point <= 0x10FF || (point >= 0x2000 && point <= 0x200D) ? 1 : 2);
+        yield { value, weight };
+      }
+    }
+
+    function weightedCount(text) {
+      let total = 0;
+      for (const { weight } of weightedTokens(text)) total += weight;
+      return total;
+    }
+
+    function packBlocks(blocks, denominatorDigits) {
+      const parts = [];
+      let current = '';
+      let used = 0;
+      // The suffix is a newline followed by "(index/total)".
+      const capacity = () => LIMIT - (4 + String(parts.length + 1).length + denominatorDigits);
+
+      function finishPart() {
+        parts.push(current);
+        current = '';
+        used = 0;
+      }
+
+      for (const block of blocks) {
+        const separator = current ? '\n\n' : '';
+        if (used + separator.length + block.weight <= capacity()) {
+          current += separator + block.text;
+          used += separator.length + block.weight;
+          continue;
+        }
+
+        if (current) finishPart();
+        if (block.weight <= capacity()) {
+          current = block.text;
+          used = block.weight;
+          continue;
+        }
+
+        // Only break a block internally when it cannot fit in an empty post.
+        for (const { value, weight } of weightedTokens(block.text)) {
+          if (used + weight > capacity()) finishPart();
+          current += value;
+          used += weight;
+        }
+      }
+
+      if (current) finishPart();
+      return parts;
+    }
+
+    function splitThread(text) {
+      if (weightedCount(text) <= LIMIT) return [text];
+
+      const blocks = text.split(/\n(?:[^\S\n]*\n)+/u)
+        .filter(block => block.trim())
+        .map(block => ({ text: block, weight: weightedCount(block) }));
+      let digits = 1;
+      let parts = packBlocks(blocks, digits);
+      while (String(parts.length).length > digits) {
+        digits = String(parts.length).length;
+        parts = packBlocks(blocks, digits);
+      }
+
+      return parts.map((part, index) => part + '\n(' + (index + 1) + '/' + parts.length + ')');
+    }
+
+    function updateCount() {
+      const total = weightedCount(draft.value);
+      count.textContent = total + ' / ' + LIMIT;
+      remaining.textContent = total > LIMIT ? (total - LIMIT) + ' 文字超過' : '残り ' + (LIMIT - total) + ' 文字';
+      meter.classList.toggle('over', total > LIMIT);
+    }
+
+    async function copyPost(text, content, button) {
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(content);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        let copied = false;
+        try {
+          copied = document.execCommand('copy');
+        } catch {
+          // Leave the text selected so it can be copied manually.
+        }
+        if (!copied) {
+          copyStatus.textContent = '自動でコピーできませんでした。選択した投稿文を手動でコピーしてください。';
+          return;
+        }
+        selection.removeAllRanges();
+        button.focus();
+      }
+      copyStatus.textContent = '投稿文をコピーしました。';
+    }
+
+    draft.addEventListener('input', () => {
+      updateCount();
+      results.replaceChildren();
+      status.textContent = '';
+      copyStatus.textContent = '';
+    });
+
+    document.querySelector('#split').addEventListener('click', () => {
+      results.replaceChildren();
+      copyStatus.textContent = '';
+      if (!draft.value.trim()) {
+        status.textContent = '投稿文を入力してください。';
+        return;
+      }
+      const posts = splitThread(draft.value);
+      status.textContent = posts.length === 1 ? '1投稿に収まります' : posts.length + '件の投稿に分割しました。';
+      posts.forEach((text, index) => {
+        const card = document.createElement('article');
+        card.className = 'post';
+        const row = document.createElement('div');
+        row.className = 'row';
+        const title = document.createElement('h2');
+        title.textContent = '投稿 ' + (index + 1);
+        const size = document.createElement('span');
+        size.textContent = weightedCount(text) + ' / ' + LIMIT;
+        title.append(size);
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'copy';
+        button.textContent = 'コピー';
+        button.setAttribute('aria-label', '投稿 ' + (index + 1) + ' をコピー');
+        const content = document.createElement('p');
+        content.textContent = text;
+        button.addEventListener('click', () => copyPost(text, content, button));
+        row.append(title, button);
+        card.append(row, content);
+        results.append(card);
+      });
+    });
+
+    updateCount();
+  </script>
+</body>
+</html>
